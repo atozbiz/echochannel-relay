@@ -1,238 +1,271 @@
-const http = require("http");
-const { spawn } = require("child_process");
-const WebSocket = require("ws");
+// server.js
+//
+// Keeps existing /live.mp3 relay behavior
+// Adds:
+//   - POST /ingest
+//   - OPTIONS /ingest for CORS preflight
+//   - browser CORS headers
+//   - multipart/form-data support for MediaRecorder uploads
+//
+// Expected multipart fields:
+//   - audio      (file blob)
+//   - mime_type  (string)
+//   - ts         (string / timestamp)
+//
+// Notes:
+// - This relay streams uploaded chunks directly to all connected /live.mp3 listeners.
+// - It also keeps a small rolling memory buffer so newly connected listeners can receive
+//   the most recent audio immediately.
+// - For Sonos compatibility, the broadcaster should ideally send MP3-compatible audio.
+//   This server does not transcode; it relays bytes as received.
 
-const PORT = process.env.PORT ? Number(process.env.PORT) : 8080;
+const express = require("express");
+const multer = require("multer");
 
-let ffmpeg = null;
-let ffmpegReady = false;
-let sourceSocket = null;
-let listeners = new Set();
-let shuttingDown = false;
+const app = express();
+const PORT = process.env.PORT || 3000;
 
-function log() {
-  console.log.apply(console, arguments);
+// -----------------------------------------------------------------------------
+// Config
+// -----------------------------------------------------------------------------
+
+// Comma-separated list of allowed origins, for example:
+// ALLOWED_ORIGINS=https://your-base44-app.com,https://preview.base44.app
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+// Rolling in-memory buffer settings
+const MAX_BUFFER_BYTES = Number(process.env.MAX_BUFFER_BYTES || 5 * 1024 * 1024); // 5 MB
+const MAX_UPLOAD_BYTES = Number(process.env.MAX_UPLOAD_BYTES || 2 * 1024 * 1024); // 2 MB
+
+// -----------------------------------------------------------------------------
+// Multipart handling
+// -----------------------------------------------------------------------------
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: MAX_UPLOAD_BYTES,
+  },
+});
+
+// -----------------------------------------------------------------------------
+// In-memory live relay state
+// -----------------------------------------------------------------------------
+
+// Connected /live.mp3 listeners
+const liveClients = new Set();
+
+// Rolling buffer of recent audio chunks for new listeners
+let recentChunks = [];
+let recentChunksBytes = 0;
+
+// Track last seen mime type from ingest
+let lastMimeType = "audio/mpeg";
+let lastChunkAt = 0;
+
+// -----------------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------------
+
+function isOriginAllowed(origin) {
+  if (!origin) return true; // non-browser or curl
+  if (ALLOWED_ORIGINS.length === 0) return true; // allow all if not configured
+  return ALLOWED_ORIGINS.includes(origin);
 }
 
-function addListener(res) {
-  listeners.add(res);
-  log("[http] listener connected:", listeners.size);
-}
+function applyCors(req, res) {
+  const origin = req.headers.origin;
 
-function removeListener(res) {
-  if (listeners.has(res)) {
-    listeners.delete(res);
-    log("[http] listener disconnected:", listeners.size);
+  if (isOriginAllowed(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin || "*");
+    res.setHeader("Vary", "Origin");
   }
+
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS, GET, HEAD");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Max-Age", "86400");
 }
 
-function broadcast(chunk) {
-  listeners.forEach(function (res) {
-    try {
-      res.write(chunk);
-    } catch (e) {
-      try {
-        res.end();
-      } catch (err) {}
-      removeListener(res);
-    }
-  });
-}
-
-function stopFfmpeg() {
-  if (!ffmpeg) return;
-
-  try {
-    ffmpeg.stdin.end();
-  } catch (e) {}
-
-  try {
-    ffmpeg.kill("SIGTERM");
-  } catch (e) {}
-
-  ffmpeg = null;
-  ffmpegReady = false;
-}
-
-function startFfmpeg() {
-  stopFfmpeg();
-
-  ffmpeg = spawn("ffmpeg", [
-    "-hide_banner",
-    "-loglevel", "error",
-    "-i", "pipe:0",
-    "-vn",
-    "-ac", "2",
-    "-ar", "44100",
-    "-b:a", "128k",
-    "-f", "mp3",
-    "pipe:1"
-  ], {
-    stdio: ["pipe", "pipe", "pipe"]
-  });
-
-  ffmpegReady = true;
-
-  ffmpeg.stdout.on("data", function (chunk) {
-    broadcast(chunk);
-  });
-
-  ffmpeg.stderr.on("data", function (chunk) {
-    var text = String(chunk || "").trim();
-    if (text) {
-      log("[ffmpeg]", text);
-    }
-  });
-
-  ffmpeg.on("close", function (code, signal) {
-    log("[ffmpeg] closed", code, signal);
-    ffmpeg = null;
-    ffmpegReady = false;
-  });
-
-  ffmpeg.on("error", function (err) {
-    log("[ffmpeg] error", err && err.message ? err.message : err);
-    ffmpeg = null;
-    ffmpegReady = false;
-  });
-}
-
-function writeToFfmpeg(buffer) {
+function addRecentChunk(buffer) {
   if (!buffer || !buffer.length) return;
 
-  if (!ffmpeg || !ffmpegReady) {
-    startFfmpeg();
-  }
+  recentChunks.push(buffer);
+  recentChunksBytes += buffer.length;
 
-  if (!ffmpeg || !ffmpeg.stdin || ffmpeg.stdin.destroyed) return;
-
-  try {
-    ffmpeg.stdin.write(buffer);
-  } catch (e) {
-    log("[relay] failed writing to ffmpeg:", e && e.message ? e.message : e);
+  while (recentChunksBytes > MAX_BUFFER_BYTES && recentChunks.length > 0) {
+    const removed = recentChunks.shift();
+    recentChunksBytes -= removed.length;
   }
 }
 
-const server = http.createServer(function (req, res) {
-  if (req.url === "/health") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({
-      ok: true,
-      has_source: !!sourceSocket,
-      listeners: listeners.size,
-      ffmpeg_ready: !!ffmpegReady
-    }));
-    return;
-  }
+function broadcastChunk(buffer) {
+  if (!buffer || !buffer.length) return;
 
-  if (req.url === "/live.mp3") {
-    res.writeHead(200, {
-      "Content-Type": "audio/mpeg",
-      "Cache-Control": "no-cache, no-store, must-revalidate",
-      "Pragma": "no-cache",
-      "Expires": "0",
-      "Connection": "keep-alive",
-      "Access-Control-Allow-Origin": "*"
-    });
-
-    addListener(res);
-
-    req.on("close", function () {
-      removeListener(res);
-    });
-
-    return;
-  }
-
-  if (req.url === "/") {
-    res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
-    res.end(
-      "EchoChannel relay running\n\n" +
-      "WebSocket ingest: wss://YOUR-DOMAIN\n" +
-      "HTTP stream: https://YOUR-DOMAIN/live.mp3\n" +
-      "Health: https://YOUR-DOMAIN/health\n"
-    );
-    return;
-  }
-
-  res.writeHead(404, { "Content-Type": "text/plain" });
-  res.end("Not found");
-});
-
-const wss = new WebSocket.Server({ server: server });
-
-wss.on("connection", function (ws) {
-  log("[ws] broadcaster connected");
-
-  if (sourceSocket && sourceSocket !== ws) {
+  for (const client of liveClients) {
     try {
-      sourceSocket.close(1013, "Another broadcaster connected");
-    } catch (e) {}
+      client.write(buffer);
+    } catch (err) {
+      try {
+        client.end();
+      } catch (_) {}
+      liveClients.delete(client);
+    }
+  }
+}
+
+function json(res, status, payload) {
+  res.status(status).json(payload);
+}
+
+// -----------------------------------------------------------------------------
+// Basic routes
+// -----------------------------------------------------------------------------
+
+app.get("/", function (req, res) {
+  res.type("text/plain").send("EchoChannel relay running");
+});
+
+app.get("/health", function (req, res) {
+  json(res, 200, {
+    ok: true,
+    live_clients: liveClients.size,
+    recent_chunks: recentChunks.length,
+    recent_buffer_bytes: recentChunksBytes,
+    last_mime_type: lastMimeType,
+    last_chunk_at: lastChunkAt || null,
+  });
+});
+
+// -----------------------------------------------------------------------------
+// /live.mp3
+// Keeps a chunked HTTP response open for listeners (e.g. Sonos)
+// -----------------------------------------------------------------------------
+
+app.get("/live.mp3", function (req, res) {
+  // Keep content-type as audio/mpeg because the working Sonos URL is /live.mp3
+  // and the existing behavior must remain stable.
+  res.status(200);
+  res.setHeader("Content-Type", "audio/mpeg");
+  res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Expires", "0");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("Transfer-Encoding", "chunked");
+  res.setHeader("X-Content-Type-Options", "nosniff");
+
+  // Some proxies behave better when headers are flushed immediately
+  if (typeof res.flushHeaders === "function") {
+    res.flushHeaders();
   }
 
-  sourceSocket = ws;
-
-  ws.on("message", function (data) {
-    if (!data) return;
-
-    var buffer = null;
-
-    if (Buffer.isBuffer(data)) {
-      buffer = data;
-    } else if (data instanceof ArrayBuffer) {
-      buffer = Buffer.from(data);
-    } else if (ArrayBuffer.isView(data)) {
-      buffer = Buffer.from(data.buffer, data.byteOffset, data.byteLength);
-    } else {
-      return;
+  // Push recent buffered chunks first so a new listener has immediate data
+  if (recentChunks.length > 0) {
+    for (const chunk of recentChunks) {
+      try {
+        res.write(chunk);
+      } catch (err) {
+        try {
+          res.end();
+        } catch (_) {}
+        return;
+      }
     }
+  }
 
-    if (!buffer.length) return;
-    writeToFfmpeg(buffer);
-  });
+  liveClients.add(res);
 
-  ws.on("close", function () {
-    log("[ws] broadcaster disconnected");
-    if (sourceSocket === ws) {
-      sourceSocket = null;
-    }
-    stopFfmpeg();
-  });
-
-  ws.on("error", function (err) {
-    log("[ws] error", err && err.message ? err.message : err);
-  });
-});
-
-server.listen(PORT, function () {
-  log("EchoChannel relay listening on port", PORT);
-});
-
-function shutdown() {
-  if (shuttingDown) return;
-  shuttingDown = true;
-
-  listeners.forEach(function (res) {
+  req.on("close", function () {
+    liveClients.delete(res);
     try {
       res.end();
-    } catch (e) {}
+    } catch (_) {}
   });
-  listeners.clear();
 
+  req.on("error", function () {
+    liveClients.delete(res);
+    try {
+      res.end();
+    } catch (_) {}
+  });
+});
+
+// -----------------------------------------------------------------------------
+// /ingest
+// Receives browser mic chunks as multipart/form-data
+// -----------------------------------------------------------------------------
+
+app.options("/ingest", function (req, res) {
+  applyCors(req, res);
+  res.status(204).end();
+});
+
+app.post("/ingest", function (req, res, next) {
+  applyCors(req, res);
+  next();
+}, upload.single("audio"), function (req, res) {
   try {
-    wss.close();
-  } catch (e) {}
+    const file = req.file;
+    const mimeType = String(req.body && req.body.mime_type ? req.body.mime_type : "").trim();
+    const ts = String(req.body && req.body.ts ? req.body.ts : "").trim();
 
-  try {
-    server.close();
-  } catch (e) {}
+    if (!file || !file.buffer || !file.buffer.length) {
+      return json(res, 400, { ok: false, error: "Missing audio file in field 'audio'" });
+    }
 
-  stopFfmpeg();
+    if (mimeType) {
+      lastMimeType = mimeType;
+    }
 
-  setTimeout(function () {
-    process.exit(0);
-  }, 200);
-}
+    lastChunkAt = Date.now();
 
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
+    // Store in rolling memory buffer for new /live.mp3 listeners
+    addRecentChunk(file.buffer);
+
+    // Stream immediately to all connected listeners
+    broadcastChunk(file.buffer);
+
+    return json(res, 200, {
+      ok: true,
+      bytes: file.buffer.length,
+      mime_type: mimeType || file.mimetype || null,
+      ts: ts || null,
+      listeners: liveClients.size,
+    });
+  } catch (err) {
+    console.error("[/ingest] error:", err);
+    return json(res, 500, { ok: false, error: "Ingest failed" });
+  }
+});
+
+// -----------------------------------------------------------------------------
+// Error handling
+// -----------------------------------------------------------------------------
+
+app.use(function (err, req, res, next) {
+  applyCors(req, res);
+
+  if (err && err.code === "LIMIT_FILE_SIZE") {
+    return json(res, 413, {
+      ok: false,
+      error: "Uploaded audio chunk is too large",
+    });
+  }
+
+  console.error("[server] uncaught error:", err);
+  return json(res, 500, {
+    ok: false,
+    error: "Server error",
+  });
+});
+
+// -----------------------------------------------------------------------------
+// Start
+// -----------------------------------------------------------------------------
+
+app.listen(PORT, function () {
+  console.log("EchoChannel relay listening on port " + PORT);
+  console.log("Allowed origins:", ALLOWED_ORIGINS.length ? ALLOWED_ORIGINS : "[all]");
+});
