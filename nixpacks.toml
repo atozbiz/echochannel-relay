@@ -1,5 +1,0 @@
-[phases.setup]
-nixPkgs = ["ffmpeg"]
-
-[start]
-cmd = "node relay.js"
