@@ -1,79 +1,50 @@
-// server.js
-//
-// Keeps existing /live.mp3 relay behavior
-// Adds:
-//   - POST /ingest
-//   - OPTIONS /ingest for CORS preflight
-//   - browser CORS headers
-//   - multipart/form-data support for MediaRecorder uploads
-//
-// Expected multipart fields:
-//   - audio      (file blob)
-//   - mime_type  (string)
-//   - ts         (string / timestamp)
-//
-// Notes:
-// - This relay streams uploaded chunks directly to all connected /live.mp3 listeners.
-// - It also keeps a small rolling memory buffer so newly connected listeners can receive
-//   the most recent audio immediately.
-// - For Sonos compatibility, the broadcaster should ideally send MP3-compatible audio.
-//   This server does not transcode; it relays bytes as received.
-
 const express = require("express");
 const multer = require("multer");
+const { spawn } = require("child_process");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// -----------------------------------------------------------------------------
-// Config
-// -----------------------------------------------------------------------------
-
-// Comma-separated list of allowed origins, for example:
+// Optional: comma-separated allowed origins in Railway variables
+// Example:
 // ALLOWED_ORIGINS=https://your-base44-app.com,https://preview.base44.app
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
+const ALLOWED_ORIGINS = String(process.env.ALLOWED_ORIGINS || "")
   .split(",")
-  .map((s) => s.trim())
+  .map(function (s) { return s.trim(); })
   .filter(Boolean);
-
-// Rolling in-memory buffer settings
-const MAX_BUFFER_BYTES = Number(process.env.MAX_BUFFER_BYTES || 5 * 1024 * 1024); // 5 MB
-const MAX_UPLOAD_BYTES = Number(process.env.MAX_UPLOAD_BYTES || 2 * 1024 * 1024); // 2 MB
-
-// -----------------------------------------------------------------------------
-// Multipart handling
-// -----------------------------------------------------------------------------
 
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: {
-    fileSize: MAX_UPLOAD_BYTES,
-  },
+    fileSize: Number(process.env.MAX_UPLOAD_BYTES || 2 * 1024 * 1024)
+  }
 });
 
-// -----------------------------------------------------------------------------
-// In-memory live relay state
-// -----------------------------------------------------------------------------
-
-// Connected /live.mp3 listeners
 const liveClients = new Set();
 
-// Rolling buffer of recent audio chunks for new listeners
-let recentChunks = [];
-let recentChunksBytes = 0;
+let recentMp3Chunks = [];
+let recentMp3Bytes = 0;
+const MAX_RECENT_MP3_BYTES = Number(process.env.MAX_RECENT_MP3_BYTES || 3 * 1024 * 1024);
 
-// Track last seen mime type from ingest
+let ffmpeg = null;
+let ffmpegStarted = false;
+let ffmpegInputMime = "";
+let ffmpegLastStartAt = 0;
+let ffmpegBytesIn = 0;
+let ffmpegBytesOut = 0;
+
 let lastMimeType = "audio/mpeg";
-let lastChunkAt = 0;
+let lastChunkAt = null;
+let ingestCount = 0;
 
-// -----------------------------------------------------------------------------
-// Helpers
-// -----------------------------------------------------------------------------
+function log() {
+  console.log.apply(console, arguments);
+}
 
 function isOriginAllowed(origin) {
-  if (!origin) return true; // non-browser or curl
-  if (ALLOWED_ORIGINS.length === 0) return true; // allow all if not configured
-  return ALLOWED_ORIGINS.includes(origin);
+  if (!origin) return true;
+  if (ALLOWED_ORIGINS.length === 0) return true;
+  return ALLOWED_ORIGINS.indexOf(origin) !== -1;
 }
 
 function applyCors(req, res) {
@@ -84,35 +55,142 @@ function applyCors(req, res) {
     res.setHeader("Vary", "Origin");
   }
 
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS, GET, HEAD");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS,HEAD");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   res.setHeader("Access-Control-Max-Age", "86400");
 }
 
-function addRecentChunk(buffer) {
+function addRecentMp3Chunk(buffer) {
   if (!buffer || !buffer.length) return;
 
-  recentChunks.push(buffer);
-  recentChunksBytes += buffer.length;
+  recentMp3Chunks.push(buffer);
+  recentMp3Bytes += buffer.length;
 
-  while (recentChunksBytes > MAX_BUFFER_BYTES && recentChunks.length > 0) {
-    const removed = recentChunks.shift();
-    recentChunksBytes -= removed.length;
+  while (recentMp3Bytes > MAX_RECENT_MP3_BYTES && recentMp3Chunks.length > 0) {
+    const removed = recentMp3Chunks.shift();
+    recentMp3Bytes -= removed.length;
   }
 }
 
-function broadcastChunk(buffer) {
+function broadcastMp3Chunk(buffer) {
   if (!buffer || !buffer.length) return;
 
-  for (const client of liveClients) {
+  addRecentMp3Chunk(buffer);
+
+  liveClients.forEach(function (res) {
     try {
-      client.write(buffer);
+      res.write(buffer);
     } catch (err) {
-      try {
-        client.end();
-      } catch (_) {}
-      liveClients.delete(client);
+      try { res.end(); } catch (e) {}
+      liveClients.delete(res);
     }
+  });
+}
+
+function stopFfmpeg() {
+  if (!ffmpeg) return;
+
+  log("[ffmpeg] stopping");
+
+  try {
+    ffmpeg.stdin.end();
+  } catch (e) {}
+
+  try {
+    ffmpeg.kill("SIGKILL");
+  } catch (e) {}
+
+  ffmpeg = null;
+  ffmpegStarted = false;
+}
+
+function getInputFormatFromMime(mimeType) {
+  const mime = String(mimeType || "").toLowerCase();
+
+  if (mime.indexOf("webm") !== -1) return "webm";
+  if (mime.indexOf("ogg") !== -1) return "ogg";
+  if (mime.indexOf("mpeg") !== -1 || mime.indexOf("mp3") !== -1) return "mp3";
+
+  return "webm";
+}
+
+function startFfmpeg(mimeType) {
+  const inputFormat = getInputFormatFromMime(mimeType);
+
+  if (ffmpeg && ffmpegStarted && ffmpegInputMime === inputFormat) {
+    return;
+  }
+
+  if (ffmpeg) {
+    stopFfmpeg();
+  }
+
+  log("[ffmpeg] starting, input format =", inputFormat);
+
+  const args = [
+    "-hide_banner",
+    "-loglevel", "error",
+    "-fflags", "nobuffer",
+    "-f", inputFormat,
+    "-i", "pipe:0",
+    "-vn",
+    "-acodec", "libmp3lame",
+    "-ac", "2",
+    "-ar", "44100",
+    "-b:a", "128k",
+    "-f", "mp3",
+    "pipe:1"
+  ];
+
+  ffmpeg = spawn("ffmpeg", args, {
+    stdio: ["pipe", "pipe", "pipe"]
+  });
+
+  ffmpegStarted = true;
+  ffmpegInputMime = inputFormat;
+  ffmpegLastStartAt = Date.now();
+
+  ffmpeg.stdout.on("data", function (chunk) {
+    ffmpegBytesOut += chunk.length;
+    broadcastMp3Chunk(chunk);
+  });
+
+  ffmpeg.stderr.on("data", function (chunk) {
+    const msg = String(chunk || "").trim();
+    if (msg) {
+      console.error("[ffmpeg stderr]", msg);
+    }
+  });
+
+  ffmpeg.on("error", function (err) {
+    console.error("[ffmpeg error]", err);
+    ffmpegStarted = false;
+    ffmpeg = null;
+  });
+
+  ffmpeg.on("close", function (code, signal) {
+    log("[ffmpeg] closed code=", code, "signal=", signal);
+    ffmpegStarted = false;
+    ffmpeg = null;
+  });
+}
+
+function ensureFfmpegForMime(mimeType) {
+  startFfmpeg(mimeType || "audio/webm;codecs=opus");
+}
+
+function writeToFfmpeg(buffer, mimeType) {
+  ensureFfmpegForMime(mimeType);
+
+  if (!ffmpeg || !ffmpeg.stdin || ffmpeg.stdin.destroyed) {
+    throw new Error("ffmpeg stdin is not available");
+  }
+
+  ffmpegBytesIn += buffer.length;
+
+  const ok = ffmpeg.stdin.write(buffer);
+  if (!ok) {
+    log("[ffmpeg] stdin backpressure");
   }
 }
 
@@ -120,33 +198,33 @@ function json(res, status, payload) {
   res.status(status).json(payload);
 }
 
-// -----------------------------------------------------------------------------
-// Basic routes
-// -----------------------------------------------------------------------------
+app.use(function (req, res, next) {
+  applyCors(req, res);
+  next();
+});
 
 app.get("/", function (req, res) {
-  res.type("text/plain").send("EchoChannel relay running");
+  res.type("text/plain").send("EchoChannel ffmpeg relay running");
 });
 
 app.get("/health", function (req, res) {
   json(res, 200, {
     ok: true,
     live_clients: liveClients.size,
-    recent_chunks: recentChunks.length,
-    recent_buffer_bytes: recentChunksBytes,
+    recent_chunks: recentMp3Chunks.length,
+    recent_buffer_bytes: recentMp3Bytes,
     last_mime_type: lastMimeType,
-    last_chunk_at: lastChunkAt || null,
+    last_chunk_at: lastChunkAt,
+    ingest_count: ingestCount,
+    ffmpeg_started: ffmpegStarted,
+    ffmpeg_input_mime: ffmpegInputMime || null,
+    ffmpeg_last_start_at: ffmpegLastStartAt || null,
+    ffmpeg_bytes_in: ffmpegBytesIn,
+    ffmpeg_bytes_out: ffmpegBytesOut
   });
 });
 
-// -----------------------------------------------------------------------------
-// /live.mp3
-// Keeps a chunked HTTP response open for listeners (e.g. Sonos)
-// -----------------------------------------------------------------------------
-
 app.get("/live.mp3", function (req, res) {
-  // Keep content-type as audio/mpeg because the working Sonos URL is /live.mp3
-  // and the existing behavior must remain stable.
   res.status(200);
   res.setHeader("Content-Type", "audio/mpeg");
   res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
@@ -156,116 +234,102 @@ app.get("/live.mp3", function (req, res) {
   res.setHeader("Transfer-Encoding", "chunked");
   res.setHeader("X-Content-Type-Options", "nosniff");
 
-  // Some proxies behave better when headers are flushed immediately
   if (typeof res.flushHeaders === "function") {
     res.flushHeaders();
   }
 
-  // Push recent buffered chunks first so a new listener has immediate data
-  if (recentChunks.length > 0) {
-    for (const chunk of recentChunks) {
+  if (recentMp3Chunks.length > 0) {
+    recentMp3Chunks.forEach(function (chunk) {
       try {
         res.write(chunk);
-      } catch (err) {
-        try {
-          res.end();
-        } catch (_) {}
-        return;
-      }
-    }
+      } catch (err) {}
+    });
   }
 
   liveClients.add(res);
+  log("[live.mp3] client connected, total =", liveClients.size);
 
   req.on("close", function () {
     liveClients.delete(res);
-    try {
-      res.end();
-    } catch (_) {}
+    log("[live.mp3] client disconnected, total =", liveClients.size);
+    try { res.end(); } catch (e) {}
   });
 
   req.on("error", function () {
     liveClients.delete(res);
-    try {
-      res.end();
-    } catch (_) {}
+    try { res.end(); } catch (e) {}
   });
 });
 
-// -----------------------------------------------------------------------------
-// /ingest
-// Receives browser mic chunks as multipart/form-data
-// -----------------------------------------------------------------------------
-
 app.options("/ingest", function (req, res) {
-  applyCors(req, res);
   res.status(204).end();
 });
 
-app.post("/ingest", function (req, res, next) {
-  applyCors(req, res);
-  next();
-}, upload.single("audio"), function (req, res) {
+app.post("/ingest", upload.single("audio"), function (req, res) {
   try {
     const file = req.file;
-    const mimeType = String(req.body && req.body.mime_type ? req.body.mime_type : "").trim();
-    const ts = String(req.body && req.body.ts ? req.body.ts : "").trim();
+    const mimeType = String((req.body && req.body.mime_type) || (file && file.mimetype) || "").trim();
+    const ts = String((req.body && req.body.ts) || "").trim();
 
     if (!file || !file.buffer || !file.buffer.length) {
-      return json(res, 400, { ok: false, error: "Missing audio file in field 'audio'" });
+      return json(res, 400, {
+        ok: false,
+        error: "Missing audio file in field 'audio'"
+      });
     }
 
-    if (mimeType) {
-      lastMimeType = mimeType;
-    }
-
+    lastMimeType = mimeType || file.mimetype || "application/octet-stream";
     lastChunkAt = Date.now();
+    ingestCount += 1;
 
-    // Store in rolling memory buffer for new /live.mp3 listeners
-    addRecentChunk(file.buffer);
-
-    // Stream immediately to all connected listeners
-    broadcastChunk(file.buffer);
+    writeToFfmpeg(file.buffer, lastMimeType);
 
     return json(res, 200, {
       ok: true,
       bytes: file.buffer.length,
-      mime_type: mimeType || file.mimetype || null,
+      mime_type: lastMimeType,
       ts: ts || null,
-      listeners: liveClients.size,
+      live_clients: liveClients.size
     });
   } catch (err) {
-    console.error("[/ingest] error:", err);
-    return json(res, 500, { ok: false, error: "Ingest failed" });
+    console.error("[/ingest] error", err);
+    return json(res, 500, {
+      ok: false,
+      error: "Ingest failed",
+      message: err && err.message ? err.message : "Unknown error"
+    });
   }
 });
 
-// -----------------------------------------------------------------------------
-// Error handling
-// -----------------------------------------------------------------------------
-
 app.use(function (err, req, res, next) {
-  applyCors(req, res);
+  console.error("[server error]", err);
 
   if (err && err.code === "LIMIT_FILE_SIZE") {
     return json(res, 413, {
       ok: false,
-      error: "Uploaded audio chunk is too large",
+      error: "Uploaded chunk too large"
     });
   }
 
-  console.error("[server] uncaught error:", err);
   return json(res, 500, {
     ok: false,
-    error: "Server error",
+    error: "Server error"
   });
 });
 
-// -----------------------------------------------------------------------------
-// Start
-// -----------------------------------------------------------------------------
+process.on("SIGTERM", function () {
+  log("[process] SIGTERM received");
+  stopFfmpeg();
+  process.exit(0);
+});
+
+process.on("SIGINT", function () {
+  log("[process] SIGINT received");
+  stopFfmpeg();
+  process.exit(0);
+});
 
 app.listen(PORT, function () {
-  console.log("EchoChannel relay listening on port " + PORT);
-  console.log("Allowed origins:", ALLOWED_ORIGINS.length ? ALLOWED_ORIGINS : "[all]");
+  log("EchoChannel ffmpeg relay listening on port", PORT);
+  log("Allowed origins:", ALLOWED_ORIGINS.length ? ALLOWED_ORIGINS : "[all]");
 });
