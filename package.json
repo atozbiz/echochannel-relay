@@ -1,0 +1,12 @@
+{
+  "name": "echochannel-relay",
+  "version": "1.0.0",
+  "private": true,
+  "main": "relay.js",
+  "scripts": {
+    "start": "node relay.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
