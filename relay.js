@@ -11,14 +11,66 @@ const PORT = process.env.PORT || 3000;
 
 // ---- STATE ----
 let broadcaster = null;
+let broadcasterId = 0;
 let ffmpeg = null;
 let listeners = new Set();
 
 let ffmpegBytesIn = 0;
 let ffmpegBytesOut = 0;
+let lastChunkAt = 0;
+let staleTimer = null;
+
+// ---- HELPERS ----
+function now() {
+  return Date.now();
+}
+
+function safeEndResponse(res) {
+  try { res.end(); } catch (e) {}
+}
+
+function cleanupListeners() {
+  listeners.forEach((res) => {
+    safeEndResponse(res);
+  });
+  listeners.clear();
+}
+
+function clearStaleTimer() {
+  if (staleTimer) {
+    clearInterval(staleTimer);
+    staleTimer = null;
+  }
+}
+
+function startStaleWatchdog(expectedBroadcasterId) {
+  clearStaleTimer();
+
+  staleTimer = setInterval(() => {
+    if (!broadcaster) {
+      forceStopBroadcast("watchdog:no-broadcaster");
+      return;
+    }
+
+    if (broadcasterId !== expectedBroadcasterId) {
+      clearStaleTimer();
+      return;
+    }
+
+    if (!lastChunkAt) return;
+
+    var age = now() - lastChunkAt;
+    if (age > 1500) {
+      console.log("🛑 Watchdog stopping stale broadcast, age:", age);
+      forceStopBroadcast("watchdog:stale-audio");
+    }
+  }, 500);
+}
 
 // ---- START FFMPEG ----
 function startFFmpeg() {
+  stopFFmpeg();
+
   console.log("🔥 Starting ffmpeg");
 
   ffmpeg = spawn("ffmpeg", [
@@ -39,8 +91,10 @@ function startFFmpeg() {
   ffmpeg.stdout.on("data", (chunk) => {
     ffmpegBytesOut += chunk.length;
 
-    listeners.forEach(res => {
-      try { res.write(chunk); } catch (e) {}
+    listeners.forEach((res) => {
+      try {
+        res.write(chunk);
+      } catch (e) {}
     });
   });
 
@@ -48,48 +102,116 @@ function startFFmpeg() {
     console.error("ffmpeg:", data.toString());
   });
 
-  ffmpeg.on("close", () => {
-    console.log("ffmpeg stopped");
+  ffmpeg.on("close", (code, signal) => {
+    console.log("ffmpeg stopped", { code, signal });
+    ffmpeg = null;
+  });
+
+  ffmpeg.on("error", (err) => {
+    console.error("ffmpeg process error:", err && err.message ? err.message : err);
     ffmpeg = null;
   });
 }
 
 // ---- STOP FFMPEG ----
 function stopFFmpeg() {
-  if (ffmpeg) {
-    try { ffmpeg.kill("SIGKILL"); } catch (e) {}
-    ffmpeg = null;
+  if (!ffmpeg) return;
+
+  try {
+    if (ffmpeg.stdin) {
+      try { ffmpeg.stdin.end(); } catch (e) {}
+      try { ffmpeg.stdin.destroy(); } catch (e) {}
+    }
+  } catch (e) {}
+
+  try { ffmpeg.kill("SIGKILL"); } catch (e) {}
+  ffmpeg = null;
+}
+
+// ---- FULL BROADCAST STOP ----
+function forceStopBroadcast(reason) {
+  console.log("🛑 forceStopBroadcast:", reason);
+
+  clearStaleTimer();
+
+  if (broadcaster) {
+    try {
+      broadcaster.removeAllListeners("message");
+      broadcaster.removeAllListeners("close");
+      broadcaster.removeAllListeners("error");
+    } catch (e) {}
+
+    try {
+      if (
+        broadcaster.readyState === WebSocket.OPEN ||
+        broadcaster.readyState === WebSocket.CONNECTING
+      ) {
+        broadcaster.close();
+      }
+    } catch (e) {}
+
+    try {
+      broadcaster.terminate();
+    } catch (e) {}
   }
+
+  broadcaster = null;
+  broadcasterId = 0;
+  lastChunkAt = 0;
+
+  stopFFmpeg();
+
+  ffmpegBytesIn = 0;
+  ffmpegBytesOut = 0;
+
+  cleanupListeners();
 }
 
 // ---- WEBSOCKET ----
 wss.on("connection", (ws) => {
   console.log("🎤 Broadcaster connected");
 
-  // Replace previous broadcaster
+  // Kill any previous session completely
   if (broadcaster) {
-    broadcaster.close();
+    forceStopBroadcast("new-broadcaster");
   }
 
   broadcaster = ws;
+  broadcasterId = now();
   ffmpegBytesIn = 0;
   ffmpegBytesOut = 0;
+  lastChunkAt = 0;
 
   startFFmpeg();
+  startStaleWatchdog(broadcasterId);
 
   ws.on("message", (data, isBinary) => {
-    if (!ffmpeg) return;
+    // Only accept chunks from the active broadcaster
+    if (ws !== broadcaster) return;
+    if (!ffmpeg || !ffmpeg.stdin) return;
+    if (!isBinary) return;
 
-    if (isBinary) {
-      ffmpegBytesIn += data.length;
+    lastChunkAt = now();
+    ffmpegBytesIn += data.length;
+
+    try {
       ffmpeg.stdin.write(data);
+    } catch (e) {
+      console.error("stdin write error:", e && e.message ? e.message : e);
+      forceStopBroadcast("stdin-write-failed");
     }
   });
 
   ws.on("close", () => {
+    if (ws !== broadcaster) return;
     console.log("🎤 Broadcaster disconnected");
-    broadcaster = null;
-    stopFFmpeg();
+    forceStopBroadcast("ws-close");
+  });
+
+  ws.on("error", (err) => {
+    if (ws !== broadcaster) return;
+    console.error("🎤 Broadcaster websocket error:", err && err.message ? err.message : err);
+    forceStopBroadcast("ws-error");
   });
 });
 
@@ -97,6 +219,10 @@ wss.on("connection", (ws) => {
 app.get("/live.mp3", (req, res) => {
   res.setHeader("Content-Type", "audio/mpeg");
   res.setHeader("Transfer-Encoding", "chunked");
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Expires", "0");
+  res.setHeader("Connection", "keep-alive");
 
   listeners.add(res);
 
@@ -108,15 +234,23 @@ app.get("/live.mp3", (req, res) => {
   });
 });
 
+// ---- MANUAL STOP ----
+app.post("/stop", (req, res) => {
+  forceStopBroadcast("manual-stop");
+  res.json({ ok: true, stopped: true });
+});
+
 // ---- HEALTH ----
 app.get("/health", (req, res) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
   res.json({
     ok: true,
     has_broadcaster: !!broadcaster,
     listeners: listeners.size,
     ffmpeg_running: !!ffmpeg,
     ffmpeg_bytes_in: ffmpegBytesIn,
-    ffmpeg_bytes_out: ffmpegBytesOut
+    ffmpeg_bytes_out: ffmpegBytesOut,
+    last_chunk_age_ms: lastChunkAt ? now() - lastChunkAt : null
   });
 });
 
